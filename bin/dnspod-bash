@@ -1,0 +1,305 @@
+#!/bin/sh
+
+script_dirname=`dirname -- "${0}"`
+script_basename=`basename -- "${0}"`
+script_version="0.1.9999"
+script_name="dnspod-bash"
+
+#exec 2>&1 >"${log_file}"
+
+dlog()
+{
+	local destination="${1}"
+	shift 1
+	echo "`date +%Y-%m-%dT%H:%M:%S`" "${script_name}" "${$}" "${@}" 1>&${destination}
+}
+
+decho()
+{
+	local destination="${1}"
+	shift 1
+	echo "${@}" 1>&${destination}
+}
+
+dvars()
+{
+	local destination="${1}"
+	shift 1
+	for var in "${@}"
+	do
+		decho "${destination}" "${var}=${!var}"
+	done
+}
+
+call_api()
+{
+	local path="${1}"
+	local data="${2}"
+	local rc http_response http_response_code http_response_data dnspod_response_code
+	set -x
+	http_response=$( "${curl}" -s -w '%{http_code}' -X POST -d "${data}&format=xml" "${dnspod_api_url}/${path}" )
+	rc="${?}"
+	set +x
+	if [ "${rc}" != "0" ]
+	then
+		dlog 2 "${path} failure: ${curl} returned ${rc} != 0"
+		return 1
+	fi
+	dlog 2 "http_response:start"
+	decho 2 "${http_response}"
+	dlog 2 "http_response:end"
+	http_response_code=$( echo "${http_response}" | sed -n '$p' )
+	http_response_data=$( echo "${http_response}" | sed '$d' )
+	dlog 2 "http_response_data:start"
+	decho 2 "${http_response_data}"
+	dlog 2 "http_response_data:end"
+	dvars 2 http_response_code
+	if [ "${http_response_code}" != "200" ]
+	then
+		dlog 2 "${path} failure: http returned ${http_response_code} != 200"
+		return 1
+	fi
+	dnspod_response_code=$( echo "${http_response_data}" | xmllint --xpath 'concat( /dnspod/status/code/text(), "" )' - )
+	dvars 2 dnspod_response_code
+	if [ "${dnspod_response_code}" != "1" ]
+	then
+		dlog 2 "${path} failure: dnspod returned ${dnspod_response_code} != 1"
+		return 1
+	fi
+	echo "${http_response_data}"
+	return 0
+}
+
+auth()
+{
+	local username="${1}"
+	local password="${2}"
+	local rc http_response_data user_token
+	http_response_data=$( call_api "Auth" "login_email=${username}&login_password=${password}" )
+	rc="${?}"
+	if [ "${rc}" != "0" ]
+	then
+		dlog 2 "call_api failure: returned ${rc} != 0"
+		return 1
+	fi
+	set -x
+	user_token=$( echo "${http_response_data}" | xmllint --xpath 'concat( /dnspod/user_token/text(), "" )' - )
+	set +x
+	dvars 2 user_token
+	if [ -z "${user_token}" ]
+	then
+		dlog 2 "auth failure: user_token blank"
+		return 1
+	fi
+	echo "${user_token}"
+	return 0
+}
+
+get_domain_id()
+{
+	local user_token="${1}"
+	local domain_name="${2}"
+	local rc http_response_data domain_id
+	http_response_data=$( call_api "Domain.List" "user_token=${user_token}" )
+	rc="${?}"
+	if [ "${rc}" != "0" ]
+	then
+		dlog "call_api failure: returned ${rc} != 0"
+		return 1
+	fi
+	set -x
+	domain_id=$( echo "${http_response_data}" | xmllint --format --xpath '/dnspod/domains/item[name="'"${domain_name}"'"]/id/text()' - )
+	set +x
+	dvars 2 domain_id
+	if [ -z "${domain_id}" ]
+	then
+		dlog 2 "auth failure: domain_id blank"
+		return 1
+	fi
+	echo "${domain_id}"
+	return 0
+}
+
+get_record_id()
+{
+	local user_token="${1}"
+	local domain_id="${2}"
+	local record_name="${3}"
+	local record_type="${4}"
+	local record_line="${5}"
+	local rc http_response_data record_id
+	http_response_data=$( call_api "Record.List" "user_token=${user_token}&domain_id=${domain_id}" )
+	rc="${?}"
+	if [ "${rc}" != "0" ]
+	then
+		dlog "call_api failure: returned ${rc} != 0"
+		return 1
+	fi
+	set -x
+	record_id=$( echo "${http_response_data}" | xmllint --format --xpath '/dnspod/records/item[name="'"${record_name}"'" and type="'"${record_type}"'" and line="'"${record_line}"'"]/id/text()' - )
+	set +x
+	dvars 2 record_id
+	if [ -z "${record_id}" ]
+	then
+		dlog 2 "auth failure: record_id blank"
+		return 1
+	fi
+	echo "${record_id}"
+	return 0
+}
+
+update_record()
+{
+	local user_token="${1}"
+	local domain_id="${2}"
+	local record_name="${3}"
+	local record_type="${4}"
+	local record_line="${5}"
+	local record_id="${6}"
+	local record_value="${7}"
+	local record_ttl="${8}"
+	local rc http_response_data record_id
+	http_response_data=$( call_api "Record.Modify" "user_token=${user_token}&domain_id=${domain_id}&record_id=${record_id}&sub_domain=${record_name}&record_type=${record_type}&record_line=${record_line}&value=${record_value}&ttl=${record_ttl}" )
+	rc="${?}"
+	if [ "${rc}" != "0" ]
+	then
+		dlog "call_api failure: returned ${rc} != 0"
+		return 1
+	fi
+	return 0
+}
+
+usage()
+{
+	if [ "${#}" -gt 0 ]
+	then
+		echo "Error: " "${@}"
+	fi
+	echo -e "${script_name} [options] record..."
+	echo -e "options:"
+	local i='\r\t\t\t\t'
+	echo -e " -h${i}this screen"
+	echo -e " -v${i}verbose"
+	echo -e " -V${i}show version"
+	echo -e " -u username${i}dnspod username"
+	echo -e " -p password${i}dnspod password"
+	echo -e " -U username${i}dnspod url"
+	echo -e " -t record_ttl${i}record ttl (default=60)"
+	echo -e " -d record_value${i}record value"
+	echo -e "..."
+	echo -e " record...${i}domain_name:record_name:record_type:record_line"
+}
+
+show_version()
+{
+	echo "${script_name} - ${script_version}"
+}
+
+verbose=false
+dnspod_api_url="https://api.dnspod.com"
+curl=curl
+unset value username password
+
+while getopts "hvVu:p:d:Ut:d:" option
+do
+	case "${option}" in
+		h)
+				usage
+				exit 0;
+			;;
+		v)
+				verbose=true
+			;;
+		V)
+				show_version "$0"
+				exit 0;
+			;;
+		u)
+				username="${OPTARG}"
+			;;
+		p)
+				password="${OPTARG}"
+			;;
+		t)
+				record_ttl="${OPTARG}"
+			;;
+		d)
+				record_value="${OPTARG}"
+			;;
+		*)
+				usage "${0}" "Unsupported option - ${option} ${OPTARG}";
+				exit 1;
+			break;;
+	esac
+done
+
+if [ -z "${username}" ]
+then
+	usage "Error: need username"
+	exit 1
+fi
+
+if [ -z "${password}" ]
+then
+	usage "Error: need username"
+	exit 1
+fi
+
+if [ -z "${record_value}" ]
+then
+	usage "Error: need username"
+	exit 1
+fi
+
+shift `expr ${OPTIND} - 1`
+
+if [ "${#}" -lt 1 ]
+then
+	usage "Error: need one or more record"
+	exit 1
+fi
+
+dlog 2 "start ..."
+dvars 2 dnspod_api_url username password record_value record_ttl
+user_token=$(auth "${username}" "${password}")
+rc="${?}"
+dvars 2 user_token
+if [ "${rc}" != "0" ]
+then
+	decho 2 "Failed to obtain user_token"
+	exit 1
+fi
+
+for record in "${@}"
+do
+	dvars 2 record
+	IFS=':' read -a record_split <<< "${record}"
+	domain_name=${record_split[0]}
+	record_name=${record_split[1]}
+	record_type=${record_split[2]}
+	record_line=${record_split[3]}
+	dvars 2 domain_name record_name record_type record_line
+	domain_id=$( get_domain_id "${user_token}" "${domain_name}" )
+	rc="${?}"
+	dvars 2 domain_id
+	if [ "${rc}" != "0" ]
+	then
+		decho 2 "Failed to get_domain_id for ${domain_name}"
+		exit 1
+	fi
+	record_id=$( get_record_id "${user_token}" "${domain_id}" "${record_name}" "${record_type}" "${record_line}" )
+	rc="${?}"
+	dvars 2 record_id
+	if [ "${rc}" != "0" ]
+	then
+		decho 2 "Failed to get_record_id for ${domain_name}"
+		exit 1
+	fi
+	update_record "${user_token}" "${domain_id}" "${record_name}" "${record_type}" "default" "${record_id}" "${record_value}" "${record_ttl}"
+	rc="${?}"
+	if [ "${rc}" != "0" ]
+	then
+		decho 2 "Failed to update_record for ${domain_name}"
+		exit 1
+	fi
+done

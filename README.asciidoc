@@ -1,0 +1,3 @@
+= dnspod-bash
+
+A simple bash client for dnspod
